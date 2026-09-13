@@ -1365,8 +1365,13 @@ public class ShareService {
         if (probe == null) {
             return null;
         }
-        return shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId())
+        // The same (type, shareId) can legitimately have multiple rows (subscription
+        // mount + temp push, different passwords); pick the first row that has a title
+        // instead of a unique-result query that throws on duplicates.
+        return shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId()).stream()
                 .map(Share::getTitle)
+                .filter(StringUtils::isNotBlank)
+                .findFirst()
                 .orElse(null);
     }
 
@@ -1382,7 +1387,7 @@ public class ShareService {
             if (probe == null) {
                 return;
             }
-            shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId()).ifPresent(share -> {
+            shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId()).forEach(share -> {
                 if (!Objects.equals(title, share.getTitle())) {
                     share.setTitle(title);
                     shareRepository.save(share);
