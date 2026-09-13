@@ -2943,6 +2943,7 @@ const retireReasonText = (resource: ResourceDto) => {
   const kind = resource.failKind
   const reason = kind === 'DEAD' ? '链接失效'
       : kind === 'ALIEN' ? '内容与订阅不符(异剧)'
+      : kind === 'POLICY' ? '单集体积不在筛选范围(追剧设置-资源筛选可调)'
       : kind === 'TRANSIENT' ? '瞬时故障连续超限'
       : '未知(旧数据)'
   const checked = resource.checkedTime ? `,检测于 ${formatTime(resource.checkedTime)}` : ''

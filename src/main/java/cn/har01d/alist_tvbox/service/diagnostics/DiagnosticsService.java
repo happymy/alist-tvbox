@@ -420,10 +420,98 @@ public class DiagnosticsService {
                 findings.add(new DiagnosticsFindingDto(DiagnosticsFindingDto.SEVERITY_WARN,
                         failed + " 条通知重试超限落入 FAILED(消息历史页可见)"));
             }
+            addSubscriptionFilterLines(section, findings);
         } catch (Exception e) {
             addUnavailable(section, findings, e);
         }
         return section;
+    }
+
+    /**
+     * 资源筛选配置入报告(2026-09-13 线上冬城猎凶:用户全局单集体积筛选拒收整目录 4K 候选,
+     * 被误报「疑似同名异剧」连环退役,排障拿不到配置对不上号)。只报数值门槛与计数,
+     * 包含/排除词的具体值不进报告(与凭证同款保守口径)。
+     */
+    private void addSubscriptionFilterLines(DiagnosticsSectionDto section, List<DiagnosticsFindingDto> findings) {
+        long floorMb = appProperties.getSubscription().getMinEpisodeSizeMb();
+        long maxMb = 0;
+        String minQuality = "";
+        int includeCount = 0;
+        int excludeCount = 0;
+        String raw = setting("msub_pool_filter", "");
+        if (!raw.isBlank()) {
+            try {
+                JsonNode node = objectMapper.readTree(raw);
+                long configured = node.path("minEpisodeSizeMb").asLong(0);
+                floorMb = configured > 0 ? configured : floorMb; // 0/缺省回落部署默认底线
+                maxMb = node.path("maxEpisodeSizeMb").asLong(0);
+                minQuality = node.path("minQuality").asText("");
+                includeCount = arraySize(node.path("includeKeywords"));
+                excludeCount = arraySize(node.path("excludeKeywords"));
+            } catch (Exception ignored) {
+                // 坏配置按未配置口径报,不拖垮区块
+            }
+        }
+        StringBuilder line = new StringBuilder("单集体积 下限 ").append(floorMb).append(" MB");
+        if (maxMb > 0) {
+            line.append(" / 上限 ").append(maxMb).append(" MB");
+        }
+        line.append(", 清晰度门槛 ").append(minQuality.isBlank() ? "无" : minQuality)
+                .append(", 包含词 ").append(includeCount).append("/排除词 ").append(excludeCount);
+        int overrides = countSubscriptionSizeOverrides();
+        int userFilters = countUserPoolFilters();
+        if (overrides > 0) {
+            line.append(";订阅级体积覆盖 ").append(overrides).append(" 个");
+        }
+        if (userFilters > 0) {
+            line.append(";用户级筛选 ").append(userFilters).append(" 份");
+        }
+        section.add("资源筛选", line.toString());
+        if (floorMb >= 1500) {
+            section.setStatus(DiagnosticsSectionDto.STATUS_WARN);
+            findings.add(new DiagnosticsFindingDto(DiagnosticsFindingDto.SEVERITY_WARN,
+                    "单集体积下限 " + floorMb + " MB 会拒收压缩版 4K 资源(常见 0.3~1.6GB/集),"
+                            + "候选可能因此全部落选(网页「追剧设置-资源筛选」可调)"));
+        }
+    }
+
+    /** 订阅级 filter_config 里配了单集体积上下限的订阅数(优先级高于全局,排障须知情)。 */
+    private int countSubscriptionSizeOverrides() {
+        try {
+            int count = 0;
+            for (MediaSubscription subscription : mediaSubscriptionRepository.findAll()) {
+                String config = subscription.getFilterConfig();
+                if (config == null || config.isBlank()) {
+                    continue;
+                }
+                try {
+                    JsonNode node = objectMapper.readTree(config);
+                    if (node.path("minEpisodeSizeMb").asLong(0) > 0 || node.path("maxEpisodeSizeMb").asLong(0) > 0) {
+                        count++;
+                    }
+                } catch (Exception ignored) {
+                    // 单行坏值跳过
+                }
+            }
+            return count;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** 多用户部署的用户级 msub_pool_filter:u{uid} 行数(每份各有自己的体积口径)。 */
+    private int countUserPoolFilters() {
+        try {
+            return (int) settingRepository.findAll().stream()
+                    .filter(s -> s.getName() != null && s.getName().startsWith("msub_pool_filter:"))
+                    .count();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static int arraySize(JsonNode node) {
+        return node != null && node.isArray() ? node.size() : 0;
     }
 
     // ------------------------------------------------------------------ 搜索源

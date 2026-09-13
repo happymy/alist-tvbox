@@ -226,15 +226,22 @@ class DiagnosticsServiceTest {
         settings.put("movie_version", "1341");
         settings.put("open_token_url", "https://ali.har01d.cn/access_token");
         settings.put("index115.share_code", "abc123DEF");
+        settings.put("msub_pool_filter", "{\"minEpisodeSizeMb\":2000,\"maxEpisodeSizeMb\":0,"
+                + "\"includeKeywords\":[\"国语\",\"4K\"],\"excludeKeywords\":[]}");
         when(settingRepository.findById(anyString())).thenAnswer(invocation -> {
             String key = invocation.getArgument(0);
             String value = settings.get(key);
             return value == null ? Optional.<cn.har01d.alist_tvbox.entity.Setting>empty()
                     : Optional.of(new cn.har01d.alist_tvbox.entity.Setting(key, value));
         });
+        when(settingRepository.findAll()).thenReturn(List.of());
         when(alistJdbcTemplate.queryForList(anyString())).thenReturn(List.of());
         when(driverAccountRepository.findAll()).thenReturn(List.of());
         when(subscriptionRepository.countByStatus(anyString())).thenReturn(0L);
+        cn.har01d.alist_tvbox.entity.MediaSubscription sized =
+                new cn.har01d.alist_tvbox.entity.MediaSubscription();
+        sized.setFilterConfig("{\"maxEpisodeSizeMb\":3000}");
+        when(subscriptionRepository.findAll()).thenReturn(List.of(sized));
         when(notifyTaskRepository.countByStatus(anyString())).thenReturn(0L);
 
         DiagnosticsService service = new DiagnosticsService(settingRepository, jdbcTemplate, alistJdbcTemplate,
@@ -267,6 +274,13 @@ class DiagnosticsServiceTest {
         assertTrue(text.contains("夸父 开"));
         assertTrue(text.contains("盘链 2 个账号"));
         assertTrue(text.contains("观影 未配置"));
+        // 追剧区块:资源筛选口径(全局下限/关键词计数/订阅级覆盖;关键词具体值不进报告)
+        assertTrue(text.contains("资源筛选"));
+        assertTrue(text.contains("下限 2000 MB"));
+        assertTrue(text.contains("包含词 2/排除词 0"));
+        assertTrue(text.contains("订阅级体积覆盖 1 个"));
+        assertFalse(text.contains("国语"), "包含词的具体值不进报告");
+        assertTrue(text.contains("单集体积下限 2000 MB"), "激进下限要有可操作告警");
         // 凭证值绝不进报告
         assertFalse(text.contains("SECRETUSER"));
         assertFalse(text.contains("SECRETPASS"));
