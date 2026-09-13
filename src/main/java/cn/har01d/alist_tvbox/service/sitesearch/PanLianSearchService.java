@@ -2,9 +2,11 @@ package cn.har01d.alist_tvbox.service.sitesearch;
 
 import cn.har01d.alist_tvbox.dto.PanLianAccountStatus;
 import cn.har01d.alist_tvbox.dto.tg.Message;
+import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.FormBody;
 import okhttp3.MediaType;
@@ -46,7 +48,9 @@ import java.util.regex.Pattern;
  * 自动并入池(按身份去重)。池内各账号独立登录态、独立每日签到(+20)、独立配额记账;
  * 搜索轮换起步,某号解锁配额用尽当场切下一号续链,全池用尽才停。凭证必须用户自配,
  * 不内置任何共享账号;全空时本源静默关闭。账号密码登录:表单 POST
- * {@code /api/auth/login},失效自动重登,连续失败 5 分钟冷却。
+ * {@code /api/auth/login},失效自动重登,连续失败 5 分钟冷却。登录取得的会话 Cookie
+ * (实测 30 天有效)按账号键落库 Setting {@code panlian_sessions}(值含凭证,只存不展示),
+ * 重启播种回内存免重登,被站点拒收且重登失败才清除 —— 失效前不重复登录。
  *
  * <p><b>配额</b>:站点按天计解锁配额(基础 30 + 每日签到 +20,按号叠加),本源另做
  * 三层防御:单次搜索解锁预算上限、解锁结果短缓存(同一检查周期重复搜索不重扣,
@@ -61,6 +65,8 @@ public class PanLianSearchService {
     public static final String COOKIE_SETTING = "panlian_cookie";
     /** 账号池:JSON 数组,元素 {"username","password"} 或 {"cookie"} */
     public static final String ACCOUNTS_SETTING = "panlian_accounts";
+    /** 登录会话持久化:JSON 对象 {"u:username":{"cookie","userId"}},cookie 实测 30 天有效,重启免重登 */
+    public static final String SESSIONS_SETTING = "panlian_sessions";
 
     private static final String DEFAULT_HOST = "https://www.xn--vzy265d.cc";
     private static final int TIMEOUT_SECONDS = 10;
@@ -88,6 +94,8 @@ public class PanLianSearchService {
     private final OkHttpClient httpClient = new OkHttpClient();
     /** 账号运行态(会话/冷却/签到/配额)按账号身份键持久于内存,池每次搜索从 Setting 重建 */
     private final ConcurrentHashMap<String, AccountState> accountStates = new ConcurrentHashMap<>();
+    /** 会话落库的读改写串行锁(JSON 整体读写,多账号并发登录互斥) */
+    private final Object sessionStoreLock = new Object();
     private final AtomicInteger rotationCursor = new AtomicInteger();
     private volatile boolean warnedNoCredentials;
     /** 解锁结果缓存:link_id → 折好提取码的最终分享链(账号无关,真实链同源) */
@@ -97,6 +105,10 @@ public class PanLianSearchService {
     }
 
     private record CachedUnlock(String url, long expiresAt) {
+    }
+
+    /** 落库会话:登录 Cookie + 站点 user_id(重启后播种回内存,保住跨形态去重)。 */
+    private record PersistedSession(String cookie, String userId) {
     }
 
     /** 账号运行态:会话 Cookie、登录冷却、签到/配额按天记账 —— 池内各账号独立配额与签到。 */
@@ -583,7 +595,45 @@ public class PanLianSearchService {
     }
 
     private Account newAccount(String key, String username, String password, String cookie) {
-        return new Account(key, username, password, cookie, accountStates.computeIfAbsent(key, k -> new AccountState()));
+        boolean cookieBased = StringUtils.isNotBlank(cookie);
+        // 播种只在账号态创建时发生一次:被站点拒收后清空的内存会话不能回灌同一张过期 Cookie
+        AccountState state = accountStates.computeIfAbsent(key, k -> cookieBased ? new AccountState() : seedState(key));
+        return new Account(key, username, password, cookie, state);
+    }
+
+    /** 从落库会话播种内存态(重启免重登);Cookie 形态凭据即会话,不播种。 */
+    private AccountState seedState(String key) {
+        AccountState state = new AccountState();
+        PersistedSession session = loadSessions().get(key);
+        if (session != null) {
+            state.sessionCookie = session.cookie();
+            state.userId = session.userId();
+            log.info("盘链账号 {} 复用持久化登录态(免重登)", key.substring(Math.min(2, key.length())));
+        }
+        return state;
+    }
+
+    /** 读落库会话:非法 JSON 容错为空(下次登录重建),值绝不进日志。 */
+    private Map<String, PersistedSession> loadSessions() {
+        Map<String, PersistedSession> sessions = new LinkedHashMap<>();
+        String raw = SiteSearchSupport.setting(settingRepository, SESSIONS_SETTING);
+        if (StringUtils.isBlank(raw)) {
+            return sessions;
+        }
+        try {
+            JsonNode node = objectMapper.readTree(raw);
+            if (node.isObject()) {
+                node.fields().forEachRemaining(field -> {
+                    String cookie = field.getValue().path("cookie").asText("").trim();
+                    if (!cookie.isEmpty()) {
+                        sessions.put(field.getKey(), new PersistedSession(cookie, field.getValue().path("userId").asText("").trim()));
+                    }
+                });
+            }
+        } catch (Exception e) {
+            log.warn("盘链持久会话解析失败(将重新登录):{}", e.getMessage());
+        }
+        return sessions;
     }
 
     /** 搜索起步账号:轮换取一个可用号(未配额尽/未冷却、登录成功),全不可用返回 null。 */
@@ -677,6 +727,7 @@ public class PanLianSearchService {
                     state.userId = userId;
                 }
                 log.info("盘链账号 {} 登录成功", account.username());
+                persistSession(account, cookie);
                 return true;
             } catch (Exception e) {
                 return loginFailed(account, e.getMessage());
@@ -687,7 +738,42 @@ public class PanLianSearchService {
     private boolean loginFailed(Account account, String reason) {
         AccountState state = account.state();
         state.sessionCookie = "";
+        // 走到登录说明旧会话已被站点拒收或从未建立,过期 Cookie 不得留在库里等重启回灌
+        persistSession(account, "");
         return state.cooldown.fail("盘链[" + account.display() + "]", reason, LOGIN_COOLDOWN_MS);
+    }
+
+    /**
+     * 会话落库:cookie 空 = 清除该账号的持久会话;失败只告警不阻断(大不了下次重启重登)。
+     * Cookie 形态账号的凭据即用户手配,不属于本方法管辖。
+     */
+    private void persistSession(Account account, String cookie) {
+        if (account.cookieBased()) {
+            return;
+        }
+        synchronized (sessionStoreLock) {
+            Map<String, PersistedSession> sessions = loadSessions();
+            if (StringUtils.isBlank(cookie)) {
+                if (sessions.remove(account.key()) != null) {
+                    saveSessions(sessions);
+                }
+                return;
+            }
+            sessions.put(account.key(), new PersistedSession(cookie, account.state().userId));
+            saveSessions(sessions);
+        }
+    }
+
+    private void saveSessions(Map<String, PersistedSession> sessions) {
+        try {
+            ObjectNode node = objectMapper.createObjectNode();
+            sessions.forEach((key, session) -> node.putObject(key)
+                    .put("cookie", session.cookie())
+                    .put("userId", session.userId()));
+            settingRepository.save(new Setting(SESSIONS_SETTING, objectMapper.writeValueAsString(node)));
+        } catch (Exception e) {
+            log.warn("盘链会话持久化失败(下次重启需重新登录):{}", e.getMessage());
+        }
     }
 
     private JsonNode getJson(Config config, Account account, String path, Map<String, String> params) throws IOException {

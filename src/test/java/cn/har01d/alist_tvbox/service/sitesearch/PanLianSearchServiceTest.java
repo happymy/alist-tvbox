@@ -4,6 +4,7 @@ import cn.har01d.alist_tvbox.dto.PanLianAccountStatus;
 import cn.har01d.alist_tvbox.dto.tg.Message;
 import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import okhttp3.FormBody;
 import okhttp3.Request;
@@ -39,6 +40,29 @@ class PanLianSearchServiceTest {
             setting.setValue(pairs[i + 1]);
             Mockito.when(repository.findById(pairs[i])).thenReturn(Optional.of(setting));
         }
+        return repository;
+    }
+
+    /** 可写 Setting 仓库桩:findById/save 走同一张内存表,模拟跨重启的持久化语义。 */
+    private static SettingRepository writableSettings(Map<String, String> store) {
+        SettingRepository repository = Mockito.mock(SettingRepository.class);
+        Mockito.when(repository.findById(Mockito.any())).thenAnswer(invocation -> {
+            String name = invocation.getArgument(0);
+            if (name == null || !store.containsKey(name)) {
+                return Optional.empty();
+            }
+            Setting setting = new Setting();
+            setting.setName(name);
+            setting.setValue(store.get(name));
+            return Optional.of(setting);
+        });
+        Mockito.when(repository.save(Mockito.any())).thenAnswer(invocation -> {
+            Setting setting = invocation.getArgument(0);
+            if (setting != null) {
+                store.put(setting.getName(), setting.getValue());
+            }
+            return setting;
+        });
         return repository;
     }
 
@@ -683,5 +707,127 @@ class PanLianSearchServiceTest {
         assertEquals(1, statuses.size());
         assertEquals("login_failed", statuses.get(0).status());
         assertNotNull(statuses.get(0).message());
+    }
+
+    @Test
+    void loginCookiePersistedAndReusedAfterRestart() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, String> store = new ConcurrentHashMap<>();
+        store.put("panlian_username", "a@b.com");
+        store.put("panlian_password", "secret");
+        AtomicInteger logins = new AtomicInteger();
+        PanLianSearchService first = new PanLianSearchService(writableSettings(store), mapper) {
+            @Override
+            protected Resp http(Request request) {
+                String path = request.url().encodedPath();
+                String method = request.method();
+                if ("POST".equals(method) && path.equals("/api/auth/login")) {
+                    logins.incrementAndGet();
+                    return new Resp(200, List.of("admin_session=sess-token-1; Path=/; Max-Age=2592000"),
+                            "{\"success\":true,\"data\":{\"user_id\":9}}");
+                }
+                if ("POST".equals(method) && path.equals("/api/tasks/checkin")) {
+                    return new Resp(200, List.of(), "{\"success\":true,\"data\":{}}");
+                }
+                if ("GET".equals(method) && path.equals("/api/videos")) {
+                    assertTrue(request.header("Cookie").contains("admin_session=sess-token-1"));
+                    return new Resp(200, List.of(), "{\"success\":true,\"data\":{\"list\":[]}}");
+                }
+                return new Resp(404, List.of(), "");
+            }
+        };
+        assertTrue(first.search("难哄").isEmpty());
+        assertEquals(1, logins.get());
+        // 登录成功即落库:cookie + user_id 一起持久
+        JsonNode persisted = mapper.readTree(store.get(PanLianSearchService.SESSIONS_SETTING));
+        assertEquals("admin_session=sess-token-1", persisted.path("u:a@b.com").path("cookie").asText());
+        assertEquals("9", persisted.path("u:a@b.com").path("userId").asText());
+
+        // 新实例=进程重启(内存账号态清零):播种落库会话,零登录
+        PanLianSearchService restarted = new PanLianSearchService(writableSettings(store), mapper) {
+            @Override
+            protected Resp http(Request request) {
+                String path = request.url().encodedPath();
+                if (path.equals("/api/auth/login")) {
+                    throw new AssertionError("持久会话有效期内不得重新登录");
+                }
+                if (path.equals("/api/tasks/checkin")) {
+                    return new Resp(200, List.of(), "{\"success\":true,\"data\":{}}");
+                }
+                if (path.equals("/api/videos")) {
+                    assertEquals("admin_session=sess-token-1", request.header("Cookie"), "重启后播种落库会话");
+                    return new Resp(200, List.of(), "{\"success\":true,\"data\":{\"list\":[]}}");
+                }
+                return new Resp(404, List.of(), "");
+            }
+        };
+        assertTrue(restarted.search("难哄").isEmpty());
+        assertEquals(1, logins.get(), "重启后复用持久化 Cookie,不再撞登录接口");
+    }
+
+    @Test
+    void stalePersistedSessionReloginsAndOverwritesStore() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, String> store = new ConcurrentHashMap<>();
+        store.put("panlian_username", "a@b.com");
+        store.put("panlian_password", "secret");
+        store.put(PanLianSearchService.SESSIONS_SETTING,
+                "{\"u:a@b.com\":{\"cookie\":\"admin_session=stale\",\"userId\":\"7\"}}");
+        AtomicInteger logins = new AtomicInteger();
+        PanLianSearchService service = new PanLianSearchService(writableSettings(store), mapper) {
+            @Override
+            protected Resp http(Request request) {
+                String path = request.url().encodedPath();
+                String method = request.method();
+                if ("POST".equals(method) && path.equals("/api/auth/login")) {
+                    logins.incrementAndGet();
+                    return new Resp(200, List.of("admin_session=fresh; Path=/"), "{\"success\":true}");
+                }
+                if ("POST".equals(method) && path.equals("/api/tasks/checkin")) {
+                    return new Resp(200, List.of(), "{\"success\":true,\"data\":{}}");
+                }
+                if ("GET".equals(method) && path.equals("/api/videos")) {
+                    if (!request.header("Cookie").contains("admin_session=fresh")) {
+                        return new Resp(200, List.of(),
+                                "{\"success\":false,\"message\":\"请先登录\",\"error_type\":\"ADMIN_AUTH_REQUIRED\"}");
+                    }
+                    return new Resp(200, List.of(), "{\"success\":true,\"data\":{\"list\":[]}}");
+                }
+                return new Resp(404, List.of(), "");
+            }
+        };
+        assertTrue(service.search("难哄").isEmpty());
+        assertEquals(1, logins.get(), "落库会话被站点拒收后必须重登一次");
+        JsonNode persisted = mapper.readTree(store.get(PanLianSearchService.SESSIONS_SETTING));
+        assertEquals("admin_session=fresh", persisted.path("u:a@b.com").path("cookie").asText(), "重登后覆盖旧会话");
+        assertEquals("7", persisted.path("u:a@b.com").path("userId").asText(), "播种的 user_id 不因重登丢失");
+    }
+
+    @Test
+    void loginFailureEvictsPersistedSession() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, String> store = new ConcurrentHashMap<>();
+        store.put("panlian_username", "a@b.com");
+        store.put("panlian_password", "changed");
+        store.put(PanLianSearchService.SESSIONS_SETTING,
+                "{\"u:a@b.com\":{\"cookie\":\"admin_session=stale\",\"userId\":\"\"}}");
+        PanLianSearchService service = new PanLianSearchService(writableSettings(store), mapper) {
+            @Override
+            protected Resp http(Request request) {
+                String path = request.url().encodedPath();
+                if (path.equals("/api/auth/login")) {
+                    return new Resp(200, List.of(), "{\"success\":false,\"message\":\"密码错误\"}");
+                }
+                if (path.equals("/api/videos")) {
+                    return new Resp(200, List.of(),
+                            "{\"success\":false,\"message\":\"请先登录\",\"error_type\":\"ADMIN_AUTH_REQUIRED\"}");
+                }
+                return new Resp(404, List.of(), "");
+            }
+        };
+        assertTrue(service.search("难哄").isEmpty());
+        // 过期会话被拒 → 重登失败(如密码已改)→ 须清除,防下次重启回灌同一张死 Cookie
+        JsonNode persisted = mapper.readTree(store.getOrDefault(PanLianSearchService.SESSIONS_SETTING, "{}"));
+        assertTrue(persisted.path("u:a@b.com").isMissingNode(), "重登失败须清除过期会话,防重启回灌死 Cookie");
     }
 }
