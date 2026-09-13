@@ -6,6 +6,7 @@ import cn.har01d.alist_tvbox.domain.DriverType;
 import cn.har01d.alist_tvbox.entity.MediaSubscription;
 import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
+import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.model.FsResponse;
 import cn.har01d.alist_tvbox.model.ShareCreateData;
 import cn.har01d.alist_tvbox.entity.Site;
@@ -136,11 +137,25 @@ public class Pan115SelfShareService {
         }
     }
 
-    /** 服务端转存一组对象(每批 ≤10 控制同步请求时长,与 TRANSFER 同款分批)。 */
+    /** 服务端转存一组对象(每批 ≤10 控制同步请求时长,与 TRANSFER 同款分批)。
+     * 115 对已收过的文件报 400「文件已接收，无需重复接收！」(上轮批次死在建分享/挂载步、
+     * 目录里留着已转存文件的残留场景)——幂等信号不是错误,吞掉继续;
+     * 是否真的到位由调用方的目录完整性校验兜底。 */
     public void transferObjects(Site site, String srcDir, List<String> names, String dstDir) {
         for (int i = 0; i < names.size(); i += 10) {
-            aListService.shareSave(site, srcDir, names.subList(i, Math.min(i + 10, names.size())), dstDir);
+            try {
+                aListService.shareSave(site, srcDir, names.subList(i, Math.min(i + 10, names.size())), dstDir);
+            } catch (BadRequestException e) {
+                if (!isAlreadyReceived(e.getMessage())) {
+                    throw e;
+                }
+                log.info("share save already received (idempotent), continue: {}", e.getMessage());
+            }
         }
+    }
+
+    static boolean isAlreadyReceived(String message) {
+        return message != null && message.contains("文件已接收");
     }
 
     /** 列目录下的对象名(残留感知与删源清单)。 */

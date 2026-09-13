@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -152,6 +153,35 @@ class Pan115SelfShareServiceTest {
         }
         service.transferObjects(new Site(), "/src", names, "/dst");
         verify(aListService, times(2)).shareSave(any(), eq("/src"), anyList(), eq("/dst"));
+    }
+
+    /** 上轮批次失败的残留场景:115 对已收过的文件报 400「文件已接收，无需重复接收！」——
+     * 幂等信号吞掉继续(完整性由调用方 listNames 校验兜底),后续批次照常提交。 */
+    @Test
+    void transferObjectsToleratesAlreadyReceived() {
+        org.mockito.Mockito.doThrow(new BadRequestException("文件已接收，无需重复接收！"))
+                .when(aListService).shareSave(any(), eq("/src"), anyList(), eq("/dst"));
+        List<String> names = new java.util.ArrayList<>();
+        for (int i = 1; i <= 11; i++) {
+            names.add("第" + i + "集.mkv");
+        }
+
+        service.transferObjects(new Site(), "/src", names, "/dst");
+
+        verify(aListService, times(2)).shareSave(any(), eq("/src"), anyList(), eq("/dst"));
+        assertTrue(Pan115SelfShareService.isAlreadyReceived("error 400 文件已接收，无需重复接收！"));
+    }
+
+    /** 其它转存错误(真失效/风控)原样上抛 —— 容忍只针对已识别的幂等信号。 */
+    @Test
+    void transferObjectsPropagatesOtherErrors() {
+        org.mockito.Mockito.doThrow(new BadRequestException("分享地址已失效"))
+                .when(aListService).shareSave(any(), eq("/src"), anyList(), eq("/dst"));
+
+        assertThrows(BadRequestException.class,
+                () -> service.transferObjects(new Site(), "/src", List.of("第1集.mkv"), "/dst"));
+        assertFalse(Pan115SelfShareService.isAlreadyReceived("分享地址已失效"));
+        assertFalse(Pan115SelfShareService.isAlreadyReceived(null));
     }
 
     /** 删源:目录下全部文件逐个提交 remove。 */
